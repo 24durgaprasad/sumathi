@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Voice Assistant</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f2f5;
+            color: #333;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            background-color: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+        h1 {
+            margin-bottom: 1rem;
+        }
+        #controlButton {
+            font-size: 1.2rem;
+            padding: 1rem 2rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.1s;
+        }
+        #controlButton.start {
+            background-color: #28a745;
+            color: white;
+        }
+        #controlButton.stop {
+            background-color: #dc3545;
+            color: white;
+        }
+        #controlButton:active {
+            transform: scale(0.98);
+        }
+        #status {
+            margin-top: 1.5rem;
+            font-size: 1rem;
+            color: #666;
+            height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Real-Time Voice Assistant</h1>
+        <button id="controlButton" class="start">Start Listening</button>
+        <div id="status">Status: Idle</div>
+    </div>
+
+    <script>
+        const controlButton = document.getElementById('controlButton');
+        const statusDiv = document.getElementById('status');
+        
+        let socket;
+        let audioContext;
+        let processor;
+        let audioSource;
+        let audioQueue = [];
+        let isPlaying = false;
+        let isRecording = false;
+
+        const connectWebSocket = () => {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            socket = new WebSocket(`${wsProtocol}${window.location.host}`);
+
+            socket.onopen = () => statusDiv.textContent = "Status: Connected. Start speaking.";
+            socket.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                if (message.type === 'audio' && message.data) {
+                    const audioChunk = base64ToArrayBuffer(message.data);
+                    audioQueue.push(audioChunk);
+                    if (!isPlaying) playNextAudioChunk();
+                } else if (message.type === 'error') {
+                    console.error("Server error:", message.message);
+                    statusDiv.textContent = `Status: Error - ${message.message}`;
+                }
+            };
+            socket.onclose = () => stopRecording();
+            socket.onerror = (error) => {
+                console.error("WebSocket error:", error);
+                statusDiv.textContent = "Status: Connection Error.";
+                stopRecording();
+            };
+        };
+
+        const startRecording = async () => {
+            if (isRecording) return;
+            try {
+                connectWebSocket();
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                // ❗ FIX: Sample rate must match TTS output (ElevenLabs is 24000)
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                }
+                
+                audioSource = audioContext.createMediaStreamSource(stream);
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = (e) => {
+                    if (!isRecording || !socket || socket.readyState !== WebSocket.OPEN) return;
+                    // We send audio at the browser's native sample rate, Deepgram handles resampling.
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const pcm16Data = convertFloat32ToInt16(inputData);
+                    socket.send(pcm16Data);
+                };
+                
+                audioSource.connect(processor);
+                processor.connect(audioContext.destination);
+
+                isRecording = true;
+                controlButton.textContent = 'Stop Listening';
+                controlButton.className = 'stop';
+                statusDiv.textContent = 'Status: Listening...';
+            } catch (err) {
+                console.error("Error starting recording:", err);
+                statusDiv.textContent = 'Status: Microphone access denied.';
+            }
+        };
+
+        const stopRecording = () => {
+            if (!isRecording) return;
+            isRecording = false;
+            if (processor) processor.disconnect();
+            if (audioSource) audioSource.disconnect();
+            if (socket) socket.close();
+            controlButton.textContent = 'Start Listening';
+            controlButton.className = 'start';
+            statusDiv.textContent = 'Status: Idle';
+        };
+
+        const playNextAudioChunk = async () => {
+            if (audioQueue.length === 0) { isPlaying = false; return; }
+            isPlaying = true;
+            const pcm16Data = audioQueue.shift();
+            const float32Data = convertInt16ToFloat32(pcm16Data);
+
+            // ❗ FIX: Buffer sample rate must match AudioContext (24000)
+            const audioBuffer = audioContext.createBuffer(1, float32Data.length, 24000);
+            audioBuffer.copyToChannel(float32Data, 0);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start();
+            source.onended = playNextAudioChunk;
+        };
+        
+        function base64ToArrayBuffer(base64) {
+            const binaryString = window.atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                // ❗ FIX: Was charCodeAt(0), should be charCodeAt(i)
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return new Int16Array(bytes.buffer);
+        }
+
+        function convertFloat32ToInt16(buffer) {
+            let l = buffer.length; 
+            const buf = new Int16Array(l);
+            while (l--) { buf[l] = Math.min(1, buffer[l]) * 0x7FFF; }
+            return buf.buffer;
+        }
+
+        function convertInt16ToFloat32(inputArray) {
+            const output = new Float32Array(inputArray.length);
+            for (let i = 0; i < inputArray.length; i++) {
+                const int = inputArray[i];
+                output[i] = int >= 0 ? int / 32767 : int / 32768;
+            }
+            return output;
+        }
+
+        controlButton.addEventListener('click', () => isRecording ? stopRecording() : startRecording());
+    </script>
+</body>
+</html>
